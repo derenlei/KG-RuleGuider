@@ -129,6 +129,51 @@ class LFramework(nn.Module):
                         fns = loss['fn']
                     else:
                         fns = torch.cat([fns, loss['fn']])
+            
+            # Check pretraining statistics
+            if self.kg.args.pretrain:
+                stdout_msg = 'Epoch {}: average training loss = {}'.format(epoch_id, np.mean(batch_losses))
+                if 'top_rule_hit' in loss:
+                    stdout_msg += ' top rules percentage = {}'.format(np.mean(top_rules_hit))
+                print(stdout_msg)
+                self.save_checkpoint(checkpoint_id=epoch_id, epoch_id=epoch_id)
+                # check dev set performance
+                if (epoch_id % self.num_peek_epochs == 0):
+                    self.eval()
+                    self.batch_size = self.dev_batch_size
+                    _, rule_scores = self.forward(dev_data, verbose=False)
+                    avg_rule_scores = torch.mean(rule_scores).cpu().numpy()
+                    if writer is not None:
+                        writer.add_scalar('data/confidence_score_dev', avg_rule_scores, epoch_id)
+
+                    # metrics = mrr
+                    metrics = avg_rule_scores
+                    print('average dev set rule confidence score: {}'.format(avg_rule_scores))
+
+                    # Action dropout anneaking
+                    # Currently not using
+                    if self.model.startswith('point'):
+                        eta = self.action_dropout_anneal_interval
+                        if len(dev_metrics_history) > eta and metrics < min(dev_metrics_history[-eta:]):
+                            old_action_dropout_rate = self.action_dropout_rate
+                            self.action_dropout_rate *= self.action_dropout_anneal_factor
+                            print('Decreasing action dropout rate: {} -> {}'.format(
+                                old_action_dropout_rate, self.action_dropout_rate))
+                    # Save checkpoint
+                    if metrics > best_dev_metrics:
+                        #self.save_checkpoint(checkpoint_id=epoch_id, epoch_id=epoch_id)
+                        self.save_checkpoint(checkpoint_id=epoch_id, epoch_id=epoch_id, is_best=True)
+                        best_dev_metrics = metrics
+                        with open(os.path.join(self.model_dir, 'best_dev_iteration.dat'), 'w') as o_f:
+                            o_f.write('{}'.format(epoch_id))
+                    else:
+                        # Early stopping
+                        if epoch_id >= self.num_wait_epochs and metrics < np.mean(
+                                dev_metrics_history[-self.num_wait_epochs:]):
+                            break
+                    dev_metrics_history.append(metrics)
+                continue
+            
             # Check training statistics
             stdout_msg = 'Epoch {}: average training loss = {}'.format(epoch_id, np.mean(batch_losses))
             if entropies:
@@ -165,7 +210,7 @@ class LFramework(nn.Module):
                 
                 # metrics = mrr
                 metrics = hit1
-                if self.kg.args.pre_train:
+                if self.kg.args.pretrain:
                     metrics = torch.mean(rule_scores).cpu().numpy()
                 if rule_scores is not None:
                     print('average dev set rule confidence score: {}'.format(torch.mean(rule_scores).cpu().numpy()))

@@ -216,20 +216,21 @@ parser.add_argument('--grid_search', action='store_true',
 
 
 # pre-training
-parser.add_argument('--pre_train', action='store_true', default=False,
-                    help='If true, use pre-train top rules reward; otherwise, use entity hit reward')
-parser.add_argument('--mute', action='store_true', default=False,
-                    help='If true, mute during inference')
-parser.add_argument('--rule_ratio', type=float, default=0.5,
-                    help='ratio of rule reward in mixed rule')
+parser.add_argument('--pretrain', action='store_true', default=False,
+                    help='pretrain relation agent with top rules')
+parser.add_argument('--pretrain_out_of_graph', action='store_true', default=False,
+                    help='pretrain without traversing in the graph')
+parser.add_argument('--pretrain_teacher_forcing', action='store_true', default=False,
+                    help='pretrain in a teacher-forcing way with labels sampled from top rules')
 
-#tensorboard name
+
+#tensorboard
 parser.add_argument('--board', type=str, default=None,
                     help='path to a tensorboard')
 
 parser.add_argument('--rule', type=str, default='topRules/WN18RR-anyburl.pickle',
                     help='path to top rule')
-parser.add_argument('--e_agent_rule_reward', action='store_true', default=False,
-                    help='entity agent share rule reward')
+parser.add_argument('--rule_ratio', type=float, default=0.5,
+                    help='ratio of rule reward in mixed rule')
 
 args = parser.parse_args()

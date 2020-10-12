@@ -32,20 +32,26 @@ class PolicyGradient(LFramework):
         self.rel2rules = pickle.load(open(args.rule, 'rb'))
 
         self.r_rule = args.rule_ratio
-        if args.pre_train:
+        if args.pretrain:
             self.r_rule = 1.0
-        self.pre_train = args.pre_train
+        self.pretrain = args.pretrain
+        self.pretrain_out_of_graph = args.pretrain_out_of_graph
+        self.pretrain_teacher_forcing = args.pretrain_teacher_forcing
+        
         self.r_prob_mask = kg.r_prob_mask
 
     def reward_fun(self, e1, r, e2, pred_e2):
         return (pred_e2 == e2).float()#, (pred_e2 == e2)
 
     def rule_reward_fun(self, r, path_trace, hit_reward_binary):
-        path = []
-        for i, (rel, ent) in enumerate(path_trace):
-            if i > 0:
-                path.append(rel.unsqueeze(1))
-        path = torch.cat(path, 1).cpu().numpy().tolist()
+        if self.pretrain and self.pretrain_out_of_graph:
+            path = torch.stack(path_trace[1:], 1).cpu().numpy().tolist()
+        else:
+            path = []
+            for i, (rel, ent) in enumerate(path_trace):
+                if i > 0:
+                    path.append(rel.unsqueeze(1))
+            path = torch.cat(path, 1).cpu().numpy().tolist()
         assert len(path) == len(r)
         reward = torch.zeros(r.shape).cuda().float()
         for i in range(len(path)):
@@ -66,23 +72,34 @@ class PolicyGradient(LFramework):
             return stabled_r
 
         e1, e2, r = self.format_batch(mini_batch, num_tiles=self.num_rollouts)
+        
+        if self.pretrain and self.pretrain_out_of_graph:
+            if self.pretrain_teacher_forcing:
+                output = self.teacher_forcing_pretrain(e1, r, e2, num_steps=self.num_rollout_steps)
+            else:
+                output = self.rollout_pretrain(e1, r, e2, num_steps=self.num_rollout_steps)
+            log_action_probs = output['log_action_probs']
+            action_entropy = output['action_entropy']
+            rule_reward = self.rule_reward_fun(r, output['path_trace'], None)
+            final_reward = rule_reward
+        else:
+            output = self.rollout(e1, r, e2, num_steps=self.num_rollout_steps)
+
+            # Compute policy gradient loss
+            pred_e2 = output['pred_e2']
+            log_action_probs = output['log_action_probs']
+            action_entropy = output['action_entropy']
+
+            # Compute discounted reward
+            r_rule = self.r_rule # ratio of rule reward
+            hit_reward, hit_reward_binary = self.reward_fun(e1, r, e2, pred_e2)
+            rule_reward = self.rule_reward_fun(r, output['path_trace'], hit_reward_binary)
+
+            final_reward = (1 - r_rule) * hit_reward + r_rule * rule_reward
+        
         output = self.rollout(e1, r, e2, num_steps=self.num_rollout_steps)
 
-        # Compute policy gradient loss
-        pred_e2 = output['pred_e2']
-        log_action_probs = output['log_action_probs']
-        action_entropy = output['action_entropy']
-
-        # Compute discounted reward
-        r_rule = self.r_rule # ratio of rule reward
-        hit_reward, hit_reward_binary = self.reward_fun(e1, r, e2, pred_e2)
-        rule_reward = self.rule_reward_fun(r, output['path_trace'], hit_reward_binary)
-        ## rule reward times -1 for unhit paths
-        #if not self.pre_train:
-        #    rule_reward = hit_reward_binary * rule_reward + (1 - hit_reward_binary) * (-1) * rule_reward
-        # update rule_reward
-    
-        final_reward = (1 - r_rule) * hit_reward + r_rule * rule_reward
+        
         if self.baseline != 'n/a':
             final_reward = stablize_reward(final_reward)
         cum_discounted_rewards = [0] * self.num_rollout_steps
@@ -124,6 +141,141 @@ class PolicyGradient(LFramework):
 
         return loss_dict
 
+    def teacher_forcing_pretrain(self, e_s, q, e_t, num_steps):
+        """
+        Perform multi-step rollout from the source entity conditioned on the query relation.
+        :param pn: Policy network.
+        :param e_s: (Variable:batch) source entity indices.
+        :param q: (Variable:batch) query relation indices.
+        :param e_t: (Variable:batch) target entity indices.
+        :param kg: Knowledge graph environment.
+        :param num_steps: Number of rollout steps.
+        :return log_action_probs: Log probability of the sampled path.
+        :return action_entropy: Entropy regularization term.
+        """
+        assert (num_steps > 0)
+        kg, pn = self.kg, self.mdl
+
+        # Initialization
+        log_action_probs = []
+        action_entropy = []
+
+        r_s = int_fill_var_cuda(e_s.size(), kg.dummy_start_r)
+        path_label = []
+        cnt = 0
+        for q_b in q:
+            if int(q_b) not in self.rel2rules.keys():
+                path_label.append(torch.randint(kg.num_relations, (num_steps,)).numpy().tolist())
+                continue
+            rules = self.rel2rules[int(q_b)]
+            cnt += 1
+            # uniform
+            # sample_rule_id = torch.randint(len(rules.keys()), (1,)).item()
+            
+            # weighted by confidence score
+            rule_dist_orig = torch.tensor(list(rules.values())).cuda()
+            rand = torch.rand(rule_dist_orig.size())
+            keep_mask = var_cuda(rand > self.action_dropout_rate).float()
+            rule_dist = rule_dist_orig * keep_mask
+            rule_sum = torch.sum(rule_dist, 0)
+            is_zero = (rule_sum == 0).float()#.unsqueeze(1)
+            rule_dist = rule_dist + is_zero * rule_dist_orig
+            sample_rule_id = torch.multinomial(rule_dist, 1).item()
+            path_label.append(list(rules.keys())[sample_rule_id])
+        path_label = torch.tensor(path_label).cuda()
+        #print('rule_path_percentage:', cnt/len(path_label))
+
+        path_trace = [r_s]
+        pn.initialize_path((r_s, e_s), kg)
+        for t in range(num_steps):
+            last_r = path_trace[-1]
+            obs = [e_s, q, e_t, t == (num_steps - 1), last_r, None]
+
+            # relation selection
+            r_prob, policy_entropy = pn.transit_r(None, obs, kg)
+            action_r = path_label[:, t]
+            action_prob = ops.batch_lookup(r_prob, action_r.view(-1,1))
+            pn.update_path_r(action_r, kg)
+
+            action_entropy.append(policy_entropy)
+
+            log_action_probs.append(ops.safe_log(action_prob))
+            path_trace.append(action_r)
+
+
+        return {
+            'log_action_probs': log_action_probs,
+            'action_entropy': action_entropy,
+            'path_trace': path_trace
+        }
+
+    def rollout_pretrain(self, e_s, q, e_t, num_steps):
+        """
+        Perform multi-step rollout from the source entity conditioned on the query relation.
+        :param pn: Policy network.
+        :param e_s: (Variable:batch) source entity indices.
+        :param q: (Variable:batch) query relation indices.
+        :param e_t: (Variable:batch) target entity indices.
+        :param kg: Knowledge graph environment.
+        :param num_steps: Number of rollout steps.
+        :return log_action_probs: Log probability of the sampled path.
+        :return action_entropy: Entropy regularization term.
+        """
+        assert (num_steps > 0)
+        kg, pn = self.kg, self.mdl
+
+        # Initialization
+        log_action_probs = []
+        action_entropy = []
+
+        r_s = int_fill_var_cuda(e_s.size(), kg.dummy_start_r)
+
+        path_trace = [r_s]
+        pn.initialize_path((r_s, e_s), kg)
+        for t in range(num_steps):
+
+            last_r = path_trace[-1]
+            obs = [e_s, q, e_t, t == (num_steps - 1), last_r, None]
+
+            # relation selection
+            r_prob, policy_entropy = pn.transit_r(None, obs, kg)
+            sample_outcome_r = self.sample_relation(r_prob)
+            action_r = sample_outcome_r['action_sample']
+            action_prob = sample_outcome_r['action_prob']
+            pn.update_path_r(action_r, kg)
+
+            action_entropy.append(policy_entropy)
+
+            log_action_probs.append(ops.safe_log(action_prob))
+            path_trace.append(action_r)
+
+
+        return {
+            'log_action_probs': log_action_probs,
+            'action_entropy': action_entropy,
+            'path_trace': path_trace
+        }
+    
+    def sample_relation(self, r_dist, inv_offset=None):
+        """
+        Sample a relation based on current policy.
+        :param inv_offset: Indexes for restoring original order in a batch.
+        :return next_r: Sampled next relation.
+        :return r_prob: Probability of the sampled relation.
+        """
+
+        if inv_offset is not None:
+            raise NotImplementedError('Relation bucket not implemented!')
+        else:
+            sample_dist = r_dist
+            next_r = torch.multinomial(sample_dist, 1, replacement = True)
+            r_prob = ops.batch_lookup(sample_dist, next_r)
+            sample_outcome = {}
+            sample_outcome['action_sample'] = next_r.view(-1)
+            sample_outcome['action_prob'] = r_prob.view(-1)
+
+        return sample_outcome
+
     def rollout(self, e_s, q, e_t, num_steps, visualize_action_probs=False):
         """
         Perform multi-step rollout from the source entity conditioned on the query relation.
@@ -135,7 +287,7 @@ class PolicyGradient(LFramework):
         :param num_steps: Number of rollout steps.
         :param visualize_action_probs: If set, save action probabilities for visualization.
         :return pred_e2: Target entities reached at the end of rollout.
-        :return log_path_prob: Log probability of the sampled path.
+        :return log_action_probs: Log probability of the sampled path.
         :return action_entropy: Entropy regularization term.
         """
         assert (num_steps > 0)
@@ -213,12 +365,8 @@ class PolicyGradient(LFramework):
             return var_cuda(torch.FloatTensor(action_mute_mask))
         
         def to_one_hot(x):
-            b_size, dim = x.shape
             y = torch.eye(self.kg.num_relations).cuda()
-            ret = []
-            for i in range(b_size):
-                ret.append(torch.index_select(y, 0, x[i]).unsqueeze(0))
-            return torch.cat(ret, 0)
+            return y[x]
 
         def apply_action_dropout_mask(r_space, action_dist, action_mask):
             
@@ -226,7 +374,7 @@ class PolicyGradient(LFramework):
             batch_idx = torch.tensor(offset[self.ct : self.ct + bucket_size]).cuda()
             r_prob_b = r_prob[batch_idx]
             
-            if not self.pre_train:
+            if not self.pretrain:
                 uni_mask = torch.zeros(r_prob_b.shape).cuda()
                 uni_mask = torch.scatter(uni_mask, 1, r_space, torch.ones(r_space.shape).cuda()).cuda()
                 r_prob_b = r_prob_b * uni_mask
@@ -241,14 +389,14 @@ class PolicyGradient(LFramework):
             r_prob_chosen_b = ops.batch_lookup(r_prob_b, r_chosen_b).unsqueeze(1)
             
             action_mute_mask = (r_space == r_chosen_b).float()
-            if self.pre_train:
+            if self.pretrain:
                 action_dist_muted = action_mute_mask * r_prob_chosen_b
             else:
                 action_dist_muted = action_dist * action_mute_mask * r_prob_chosen_b
 
             dist_sum = torch.sum(action_dist_muted, 1)
             is_zero = (dist_sum == 0).float().unsqueeze(1)
-            if self.pre_train:
+            if self.pretrain:
                 uniform_dist = torch.ones(action_dist[0].size()).float().cuda()
                 action_dist_muted = action_dist_muted + is_zero * uniform_dist
             else:

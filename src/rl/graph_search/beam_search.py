@@ -24,6 +24,38 @@ def beam_search(pn, e_s, q, e_t, kg, num_steps, beam_size, return_path_component
     assert (num_steps >= 1)
     batch_size = len(e_s)
 
+    def top_k_action_r(log_action_dist):
+        """
+        Get top k relations.
+            - k = beam_size if the beam size is smaller than or equal to the beam action space size
+            - k = beam_action_space_size otherwise
+        :param log_action_dist: [batch_size*k, action_space_size]
+        :return:
+            next_r, log_action_prob, action_offset: [batch_size*new_k]
+        """
+        full_size = len(log_action_dist)
+        assert (full_size % batch_size == 0)
+        last_k = int(full_size / batch_size)
+
+        action_space_size = log_action_dist.size()[1]
+        # => [batch_size, k'*action_space_size]
+        log_action_dist = log_action_dist.view(batch_size, -1)
+        beam_action_space_size = log_action_dist.size()[1]
+        k = min(beam_size, beam_action_space_size)
+        # [batch_size, k]
+        log_action_prob, action_ind = torch.topk(log_action_dist, k)
+        next_r = (action_ind % action_space_size).view(-1)
+        # [batch_size, k] => [batch_size*k]
+        log_action_prob = log_action_prob.view(-1)
+        # compute parent offset
+        # [batch_size, k]
+        action_beam_offset = action_ind / action_space_size
+        # [batch_size, 1]
+        action_batch_offset = int_var_cuda(torch.arange(batch_size) * last_k).unsqueeze(1)
+        # [batch_size, k] => [batch_size*k]
+        action_offset = (action_batch_offset + action_beam_offset).view(-1)
+        return next_r, log_action_prob, action_offset
+
     def top_k_action(log_action_dist, action_space):
         """
         Get top k actions.
@@ -34,7 +66,7 @@ def beam_search(pn, e_s, q, e_t, kg, num_steps, beam_size, return_path_component
             r_space: [batch_size*k, action_space_size]
             e_space: [batch_size*k, action_space_size]
         :return:
-            (next_r, next_e), action_prob, action_offset: [batch_size*new_k]
+            (next_r, next_e), log_action_prob, action_offset: [batch_size*new_k]
         """
         full_size = len(log_action_dist)
         assert (full_size % batch_size == 0)
@@ -71,7 +103,7 @@ def beam_search(pn, e_s, q, e_t, kg, num_steps, beam_size, return_path_component
             r_space: [batch_size*beam_size, action_space_size]
             e_space: [batch_size*beam_size, action_space_size]
         :return:
-            (next_r, next_e), action_prob, action_offset: [batch_size*k]
+            (next_r, next_e), log_action_prob, action_offset: [batch_size*k]
         """
         full_size = len(log_action_dist)
         assert (full_size % batch_size == 0)
@@ -119,17 +151,11 @@ def beam_search(pn, e_s, q, e_t, kg, num_steps, beam_size, return_path_component
             search_trace[i] = (new_r, new_e)
 
     def to_one_hot(x):
-        b_size, dim = x.shape
         y = torch.eye(kg.num_relations).cuda()
-#         ret = []
-#         for i in range(b_size):
-#             ret.append(torch.index_select(y, 0, x[i]).unsqueeze(0))
-#         return torch.cat(ret, 0)
         return y[x]
 
-    def adjust_relation_trace(relation_trace, action_offset, action):
-        new_r, new_e = action
-        return torch.cat([relation_trace[action_offset], new_r.unsqueeze(1)], 1)
+    def adjust_relation_trace(relation_trace, action_offset, relation):
+        return torch.cat([relation_trace[action_offset], relation.unsqueeze(1)], 1)
 
     # Initialization
     r_s = int_fill_var_cuda(e_s.size(), kg.dummy_start_r)
@@ -152,6 +178,77 @@ def beam_search(pn, e_s, q, e_t, kg, num_steps, beam_size, return_path_component
         log_action_probs = []
 
     action = init_action
+    
+    # pretrain evaluation without traversing in the graph
+    if kg.args.pretrain and kg.args.pretrain_out_of_graph:
+        for t in range(num_steps):
+            last_r, e = action
+            assert (q.size() == e_s.size())
+            assert (q.size() == e_t.size())
+            assert (e.size()[0] % batch_size == 0)
+            assert (q.size()[0] % batch_size == 0)
+            k = int(e.size()[0] / batch_size)
+            # => [batch_size*k]
+            q = ops.tile_along_beam(q.view(batch_size, -1)[:, 0], k)
+            e_s = ops.tile_along_beam(e_s.view(batch_size, -1)[:, 0], k)
+            e_t = ops.tile_along_beam(e_t.view(batch_size, -1)[:, 0], k)
+            obs = [e_s, q, e_t, t == (num_steps - 1), last_r, None]
+
+            # one step forward in relation search
+            r_prob, _ = pn.transit_r(e, obs, kg)
+
+            # => [batch_size*k, relation_space_size]
+            log_action_dist = log_action_prob.view(-1, 1) + ops.safe_log(r_prob)
+            #action_space = torch.stack([torch.arange(kg.num_relations)] * len(r_prob), 0).long().cuda()
+
+            action_r, log_action_prob, action_offset = top_k_action_r(log_action_dist)
+
+            if return_path_components:
+                ops.rearrange_vector_list(log_action_probs, action_offset)
+                log_action_probs.append(log_action_prob)
+            pn.update_path_r(action_r, kg, offset=action_offset)
+
+            if kg.args.save_beam_search_paths:
+                adjust_search_trace(search_trace, action_offset)
+            relation_trace = adjust_relation_trace(relation_trace, action_offset, action_r)
+
+            # one step forward in entity search
+            k = int(action_r.size()[0] / batch_size)
+            # => [batch_size*k]
+            q = ops.tile_along_beam(q.view(batch_size, -1)[:, 0], k)
+            e_s = ops.tile_along_beam(e_s.view(batch_size, -1)[:, 0], k)
+            e_t = ops.tile_along_beam(e_t.view(batch_size, -1)[:, 0], k)
+            e = e[action_offset]
+            action = (action_r, e)
+
+            seen_nodes = torch.cat([seen_nodes[action_offset], action[1].unsqueeze(1)], dim=1)
+            if kg.args.save_beam_search_paths:
+                search_trace.append(action)
+
+
+        output_beam_size = int(action[0].size()[0] / batch_size)
+        # [batch_size*beam_size] => [batch_size, beam_size]
+        beam_search_output = dict()
+        beam_search_output['pred_e2s'] = action[1].view(batch_size, -1)
+        beam_search_output['pred_e2_scores'] = log_action_prob.view(batch_size, -1)
+        if kg.args.save_beam_search_paths:
+            beam_search_output['search_traces'] = search_trace
+        rule_score = torch.zeros(batch_size, output_beam_size).cuda().float()
+        top_rules = pickle.load(open(kg.args.rule, 'rb'))
+        for i in range(batch_size):
+            for j in range(output_beam_size):
+                path_ij = relation_trace[i * output_beam_size + j, 1 : ].cpu().numpy().tolist()
+                if not int(init_q[i]) in top_rules.keys():
+                    rule_score[i][j] = 0.0
+                elif tuple(path_ij) in top_rules[int(init_q[i])].keys():
+                    rule_score[i][j] = top_rules[int(init_q[i])][tuple(path_ij)]
+                #print(tuple(relation_trace[i * output_beam_size + j, 1 : ]))
+                #print(top_rules[int(init_q[i])].keys())
+        # rule_score = (rule_score > 0).float()
+        beam_search_output["rule_score"] = torch.mean(rule_score, 1)
+        assert len(beam_search_output["rule_score"]) == batch_size
+        return beam_search_output
+    
     for t in range(num_steps):
         last_r, e = action
         assert (q.size() == e_s.size())
@@ -172,7 +269,7 @@ def beam_search(pn, e_s, q, e_t, kg, num_steps, beam_size, return_path_component
         # incorporate r_prob
         (r_space, e_space), action_mask = action_space
         r_prob, _ = pn.transit_r(e, obs, kg)
-        if kg.args.pre_train:
+        if kg.args.pretrain:
             r_space = torch.ones(len(r_space), kg.num_relations).long() * torch.arange(kg.num_relations)
             r_space = r_space.cuda()
             e_space = torch.ones(len(e_space), kg.num_relations).long().cuda()
@@ -190,7 +287,7 @@ def beam_search(pn, e_s, q, e_t, kg, num_steps, beam_size, return_path_component
         # => [batch_size*k, action_space_size]
         log_action_dist = log_action_prob.view(-1, 1) + ops.safe_log(action_dist)
         # [batch_size*k, action_space_size] => [batch_size*new_k]
-        if t == num_steps - 1 and not kg.args.pre_train:
+        if t == num_steps - 1 and not kg.args.pretrain:
             action, log_action_prob, action_offset = top_k_answer_unique(log_action_dist, action_space)
         else:
             action, log_action_prob, action_offset = top_k_action(log_action_dist, action_space)
@@ -202,7 +299,7 @@ def beam_search(pn, e_s, q, e_t, kg, num_steps, beam_size, return_path_component
         if kg.args.save_beam_search_paths:
             adjust_search_trace(search_trace, action_offset)
             search_trace.append(action)
-        relation_trace = adjust_relation_trace(relation_trace, action_offset, action)
+        relation_trace = adjust_relation_trace(relation_trace, action_offset, action[0])
     
     
     output_beam_size = int(action[0].size()[0] / batch_size)

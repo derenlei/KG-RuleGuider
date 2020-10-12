@@ -26,11 +26,6 @@ class GraphSearchPolicy(nn.Module):
         self.path = None
         self.path_r = None
 
-        # rule miner
-        self.rule_miner_hidden_size_LSTM = args.history_dim
-        self.relation_size = args.relation_dim
-        self.rule_miner_layer_LSTM = args.history_num_layers
-
         # Set policy network modules
         self.define_modules()
         self.initialize_modules()
@@ -197,9 +192,9 @@ class GraphSearchPolicy(nn.Module):
         init_c = zeros_var_cuda([self.history_num_layers, len(init_entity_embedding), self.history_dim])
         self.path = [self.entity_agent(init_entity_embedding, (init_h, init_c))[1]]
         
-        init_h = zeros_var_cuda([self.rule_miner_layer_LSTM, len(init_relation_embedding), self.rule_miner_hidden_size_LSTM])
-        init_c = zeros_var_cuda([self.rule_miner_layer_LSTM, len(init_relation_embedding), self.rule_miner_hidden_size_LSTM])
-        self.path_r = [self.rule_agent(init_relation_embedding, (init_h, init_c))[1]]
+        init_h = zeros_var_cuda([self.history_num_layers, len(init_relation_embedding), self.history_dim])
+        init_c = zeros_var_cuda([self.history_num_layers, len(init_relation_embedding), self.history_dim])
+        self.path_r = [self.relation_agent(init_relation_embedding, (init_h, init_c))[1]]
 
 
     def update_path(self, action, kg, offset=None):
@@ -228,7 +223,30 @@ class GraphSearchPolicy(nn.Module):
             
         torch.backends.cudnn.enabled = False
         self.path.append(self.entity_agent(entity_embedding.unsqueeze(1), self.path[-1])[1])
-        self.path_r.append(self.rule_agent(relation_embedding.unsqueeze(1), self.path_r[-1])[1])
+        self.path_r.append(self.relation_agent(relation_embedding.unsqueeze(1), self.path_r[-1])[1])
+    
+    def update_path_r(self, relation, kg, offset=None):
+        """
+        Once an action was selected, update the action history.
+        :param r: (Variable:batch) indices of the most recent relation (most recently traversed edge)
+        :param offset: (Variable:batch) if None, adjust path history with the given offset, used for search
+        :param KG: Knowledge graph environment.
+        """
+
+        def offset_path_history(p, offset):
+            for i, x in enumerate(p):
+                if type(x) is tuple:
+                    new_tuple = tuple([_x[:, offset, :] for _x in x])
+                    p[i] = new_tuple
+                else:
+                    p[i] = x[offset, :]
+
+        relation_embedding = kg.get_relation_embeddings(relation)
+        if offset is not None:
+            offset_path_history(self.path_r, offset)
+            
+        torch.backends.cudnn.enabled = False
+        self.path_r.append(self.relation_agent(relation_embedding.unsqueeze(1), self.path_r[-1])[1])
 
     def get_action_space_in_buckets(self, e, obs, kg, collapse_entities=False):
         """
@@ -408,20 +426,20 @@ class GraphSearchPolicy(nn.Module):
         self.W2 = nn.Linear(self.entity_dim, self.entity_dim)
         self.W1Dropout = nn.Dropout(p=self.ff_dropout_rate)
         self.W2Dropout = nn.Dropout(p=self.ff_dropout_rate)
-        self.LN1 = nn.Linear(self.rule_miner_hidden_size_LSTM + self.relation_size, self.relation_size)
-        self.LN2 = nn.Linear(self.relation_size, self.relation_size)
+        self.LN1 = nn.Linear(self.history_dim + self.relation_dim, self.relation_dim)
+        self.LN2 = nn.Linear(self.relation_dim, self.relation_dim)
         self.LN1Dropout = nn.Dropout(p=self.ff_dropout_rate)
         self.LN2Dropout = nn.Dropout(p=self.ff_dropout_rate)
-        self.rule_agent = nn.LSTM(input_size = self.relation_size, 
-                                  hidden_size = self.rule_miner_hidden_size_LSTM,
-                                  num_layers = self.rule_miner_layer_LSTM,
+        self.relation_agent = nn.LSTM(input_size = self.relation_dim, 
+                                  hidden_size = self.history_dim,
+                                  num_layers = self.history_num_layers,
                                   batch_first = True)
         self.entity_agent = nn.LSTM(input_size = self.entity_dim,
                                     hidden_size = self.history_dim,
                                     num_layers = self.history_num_layers,
                                     batch_first = True)
         if torch.cuda.is_available():
-            self.rule_agent = self.rule_agent.cuda()
+            self.relation_agent = self.relation_agent.cuda()
             self.entity_agent = self.entity_agent.cuda()
             self.W1 = self.W1.cuda()
             self.W2 = self.W2.cuda()
@@ -445,7 +463,7 @@ class GraphSearchPolicy(nn.Module):
                     nn.init.xavier_normal_(param)
             nn.init.xavier_uniform_(self.LN1.weight)
             nn.init.xavier_uniform_(self.LN2.weight)
-            for name, param in self.rule_agent.named_parameters():
+            for name, param in self.relation_agent.named_parameters():
                 if 'bias' in name:
                     nn.init.constant_(param, 0.0)
                 elif 'weight' in name:

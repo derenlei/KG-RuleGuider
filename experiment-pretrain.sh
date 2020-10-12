@@ -60,6 +60,7 @@ cmd="python3 -m src.experiments \
     --conve_state_dict_path $conve_state_dict_path \
     --gpu $gpu \
     --rule $rule \
+    --pretrain \
     $ARGS"
 
 echo "Executing $cmd"
